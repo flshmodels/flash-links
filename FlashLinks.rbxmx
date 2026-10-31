@@ -1,0 +1,308 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">FlashLinks</string>
+      <ProtectedString name="Source">if not plugin then return end
+
+local Selection = game:GetService("Selection")
+local RunService = game:GetService("RunService")
+local Ui = require(script.Ui)
+local Adapter = require(script.Adapter)
+local panel = Ui.new(plugin, "FlashLinks", "Flash Links", "Links")
+panel.label("Review object references. Findings are snapshots, not proof of a bug. This tool never repairs or deletes anything.")
+local results = {}
+local rows = {}
+local status
+local function clear()
+    results = {}
+    for _, row in ipairs(rows) do row.Visible = false end
+end
+local unset = panel.cycle("Report unset references", { "On", "Off" }, function()
+    clear()
+    status.Text = "Options changed. Scan again."
+end)
+status = panel.label("Scan selected roots and their descendants, or scan Workspace.")
+local function scan(roots)
+    clear()
+    if RunService:IsRunning() then status.Text = "Stop the play test first." return end
+    local ok, result = pcall(Adapter.scan, roots, unset() == "On")
+    if not ok then status.Text = "Scan stopped: " .. tostring(result) return end
+    results = result.findings
+    status.Text = string.format("%d objects scanned / %d supported objects checked / %d findings. Showing %d. Click a row to select its owner. Nothing was edited.", result.scanned, result.checked, result.total, #results)
+    for index, finding in ipairs(results) do
+        rows[index].Text = finding.code .. " / " .. finding.property .. "\n" .. finding.path .. "\n" .. finding.message
+        rows[index].Visible = true
+    end
+end
+panel.button("Scan selection and descendants", function() scan(Selection:Get()) end)
+panel.button("Scan Workspace", function() scan({ workspace }) end)
+for index = 1, 100 do
+    local slot = index
+    local row = panel.button("", function()
+        local finding = results[slot]
+        if finding and finding.target:IsDescendantOf(game) then
+            Selection:Set({ finding.target })
+        else
+            status.Text = "That object was removed. Scan again."
+        end
+    end)
+    row.Size = UDim2.new(1, 0, 0, 100)
+    row.TextSize = 14
+    row.TextTruncate = Enum.TextTruncate.AtEnd
+    row.Visible = false
+    rows[index] = row
+end
+plugin.Unloading:Connect(function() panel.destroy() end)
+</ProtectedString>
+    </Properties>
+    <Item class="ModuleScript" referent="RBX1">
+      <Properties>
+        <string name="Name">Adapter</string>
+        <ProtectedString name="Source">local Rules = require(script.Parent.Rules)
+local Scope = require(script.Parent.Scope)
+local Adapter = {}
+local twoAttachmentConstraints = {
+    HingeConstraint = true, BallSocketConstraint = true, RopeConstraint = true,
+    RodConstraint = true, SpringConstraint = true, RigidConstraint = true,
+}
+
+local function properties(object)
+    if object:IsA("ObjectValue") then return { { "Value" } } end
+    if object:IsA("Model") then
+        return if object.PrimaryPart then { { "PrimaryPart", "BasePart", true } } else {}
+    end
+    if object:IsA("Beam") or object:IsA("Trail") or twoAttachmentConstraints[object.ClassName] then
+        return { { "Attachment0", "Attachment" }, { "Attachment1", "Attachment" } }
+    end
+    if object:IsA("JointInstance") or object:IsA("WeldConstraint") or object:IsA("NoCollisionConstraint") then
+        return { { "Part0", "BasePart" }, { "Part1", "BasePart" } }
+    end
+    return {}
+end
+
+function Adapter.scan(roots, reportUnset)
+    local objects, scanned = Scope.collect(roots, true, function() return true end, {
+        maxNodes = 20000, maxTargets = 20000, allowServices = true,
+    })
+    local records = {}
+    for _, object in ipairs(objects) do
+        local fields = properties(object)
+        if #fields &gt; 0 then
+            local references = {}
+            for _, field in ipairs(fields) do
+                local value = object[field[1]]
+                table.insert(references, {
+                    property = field[1], present = value ~= nil,
+                    attached = value ~= nil and (value == game or value:IsDescendantOf(game)),
+                    validType = value == nil or field[2] == nil or value:IsA(field[2]),
+                    withinOwner = value == nil or not field[3] or value:IsDescendantOf(object),
+                })
+            end
+            table.insert(records, {
+                target = object, path = object:GetFullName(), references = references,
+                sameEndpoints = #fields == 2 and object[fields[1][1]] ~= nil and object[fields[1][1]] == object[fields[2][1]],
+                pair = if #fields == 2 then fields[1][1] .. " / " .. fields[2][1] else "",
+            })
+        end
+    end
+    local result = Rules.analyze(records, reportUnset, 100)
+    result.scanned = scanned
+    result.checked = #records
+    return result
+end
+
+return Adapter
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX2">
+      <Properties>
+        <string name="Name">Rules</string>
+        <ProtectedString name="Source">local Rules = {}
+
+function Rules.analyze(records, reportUnset, maxResults)
+    assert(type(maxResults) == "number" and maxResults % 1 == 0 and maxResults &gt;= 1 and maxResults &lt;= 500, "Result limit must be 1-500.")
+    local findings, total = {}, 0
+    local function emit(record, property, code, message)
+        total += 1
+        if #findings &lt; maxResults then
+            table.insert(findings, { target = record.target, path = record.path, property = property, code = code, message = message })
+        end
+    end
+    for _, record in ipairs(records) do
+        for _, reference in ipairs(record.references) do
+            if not reference.present then
+                if reportUnset then emit(record, reference.property, "UNSET", "No target is assigned. This may be intentional.") end
+            elseif not reference.attached then
+                emit(record, reference.property, "DETACHED", "The target is outside the open DataModel.")
+            elseif not reference.validType then
+                emit(record, reference.property, "WRONG_TYPE", "The target does not have the expected class.")
+            elseif not reference.withinOwner then
+                emit(record, reference.property, "OUTSIDE_MODEL", "The PrimaryPart is not inside its owning Model.")
+            end
+        end
+        if record.sameEndpoints then
+            emit(record, record.pair, "SAME_ENDPOINT", "Both endpoints use the same target. Check whether that is intentional.")
+        end
+    end
+    return { findings = findings, total = total }
+end
+
+return Rules
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX3">
+      <Properties>
+        <string name="Name">Scope</string>
+        <ProtectedString name="Source">local Scope = {}
+
+function Scope.collect(roots, expand, predicate, limits)
+    limits = limits or { maxNodes = 5000, maxTargets = 1000, allowServices = false }
+    assert(#roots &gt; 0 and #roots &lt;= 500, "Choose between 1 and 500 selection roots.")
+    local queued, stack, targets = {}, {}, {}
+    local discovered = 0
+    local function enqueue(object)
+        if queued[object] then return end
+        discovered += 1
+        assert(discovered &lt;= limits.maxNodes, "Scope exceeds " .. limits.maxNodes .. " objects. Select a smaller area.")
+        queued[object] = true
+        table.insert(stack, object)
+    end
+    for index = #roots, 1, -1 do
+        local object = roots[index]
+        assert(object.Parent and object:IsDescendantOf(game), "Selection contains a detached object.")
+        assert(limits.allowServices or object.Parent ~= game, "Select objects inside a service, not the service itself.")
+        enqueue(object)
+    end
+    while #stack &gt; 0 do
+        local object = table.remove(stack)
+        if predicate(object) then
+            assert(#targets &lt; limits.maxTargets, "More than " .. limits.maxTargets .. " targets. Select a smaller area.")
+            table.insert(targets, object)
+        end
+        if expand then
+            local children = object:GetChildren()
+            for index = #children, 1, -1 do enqueue(children[index]) end
+        end
+    end
+    return targets, discovered
+end
+
+return Scope
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX4">
+      <Properties>
+        <string name="Name">Ui</string>
+        <ProtectedString name="Source">local Ui = {}
+
+function Ui.new(plugin, id, title, action)
+    local studio = settings().Studio
+    local colors = {}
+    local connections = {}
+    local toolbar = plugin:CreateToolbar(title)
+    local toggle = toolbar:CreateButton(id, title, "", action)
+    local widget = plugin:CreateDockWidgetPluginGuiAsync(id .. "_v1", DockWidgetPluginGuiInfo.new(
+        Enum.InitialDockState.Right, false, false, 380, 600, 280, 260
+    ))
+    widget.Title = title
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.fromScale(1, 1)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 6
+    scroll.CanvasSize = UDim2.new()
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.Parent = widget
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 14)
+    padding.PaddingBottom = UDim.new(0, 14)
+    padding.PaddingLeft = UDim.new(0, 14)
+    padding.PaddingRight = UDim.new(0, 20)
+    padding.Parent = scroll
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 9)
+    layout.Parent = scroll
+    local order = 0
+    local function theme(object, property, color)
+        table.insert(colors, { object, property, color })
+        object[property] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[color])
+    end
+    theme(scroll, "BackgroundColor3", "MainBackground")
+    theme(scroll, "ScrollBarImageColor3", "MainText")
+    local function add(class, text)
+        order = order + 1
+        local object = Instance.new(class)
+        object.LayoutOrder = order
+        object.Size = UDim2.new(1, 0, 0, 32)
+        object.BorderSizePixel = 0
+        object.Font = Enum.Font.SourceSans
+        object.TextSize = 16
+        object.Text = text
+        object.TextWrapped = true
+        object.Parent = scroll
+        theme(object, "TextColor3", "MainText")
+        return object
+    end
+    local panel = { widget = widget }
+    function panel.label(text)
+        local object = add("TextLabel", text)
+        object.Size = UDim2.new(1, 0, 0, 0)
+        object.AutomaticSize = Enum.AutomaticSize.Y
+        object.BackgroundTransparency = 1
+        object.TextXAlignment = Enum.TextXAlignment.Left
+        return object
+    end
+    function panel.field(caption, initial)
+        panel.label(caption)
+        local object = add("TextBox", initial)
+        object.ClearTextOnFocus = false
+        object.TextWrapped = false
+        theme(object, "BackgroundColor3", "InputFieldBackground")
+        return object
+    end
+    function panel.button(text, callback)
+        local object = add("TextButton", text)
+        theme(object, "BackgroundColor3", "Button")
+        table.insert(connections, object.Activated:Connect(callback))
+        return object
+    end
+    function panel.cycle(caption, choices, changed)
+        local index = 1
+        local button
+        button = panel.button(caption .. ": " .. choices[index], function()
+            index = index % #choices + 1
+            button.Text = caption .. ": " .. choices[index]
+            changed()
+        end)
+        return function() return choices[index] end
+    end
+    panel.label(title)
+    table.insert(connections, toggle.Click:Connect(function() widget.Enabled = not widget.Enabled end))
+    table.insert(connections, widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+        toggle:SetActive(widget.Enabled)
+    end))
+    table.insert(connections, studio.ThemeChanged:Connect(function()
+        for _, item in ipairs(colors) do
+            item[1][item[2]] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[item[3]])
+        end
+    end))
+    toggle:SetActive(widget.Enabled)
+    function panel.destroy()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        widget:Destroy()
+        toolbar:Destroy()
+    end
+    return panel
+end
+
+return Ui
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
